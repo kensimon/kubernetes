@@ -424,7 +424,7 @@ func checkAndKeepInitContainers(pod *v1.Pod, podStatus *kubecontainer.PodStatus,
 }
 
 // computePodContainerChanges checks whether the pod spec has changed and returns the changes if true.
-func (m *kubeGenericRuntimeManager) computePodContainerChanges(pod *v1.Pod, podStatus *kubecontainer.PodStatus) podContainerSpecChanges {
+func (m *kubeGenericRuntimeManager) computePodContainerChanges(pod *v1.Pod, podStatus *kubecontainer.PodStatus, existingStatus *v1.PodStatus) podContainerSpecChanges {
 	glog.V(5).Infof("Syncing Pod %q: %+v", format.Pod(pod), pod)
 
 	sandboxChanged, attempt, sandboxID := m.podSandboxChanged(pod, podStatus)
@@ -436,6 +436,16 @@ func (m *kubeGenericRuntimeManager) computePodContainerChanges(pod *v1.Pod, podS
 		ContainersToKeep:     make(map[kubecontainer.ContainerID]int),
 		InitContainersToKeep: make(map[kubecontainer.ContainerID]int),
 		ContainersToKill:     make(map[kubecontainer.ContainerID]containerToKillInfo),
+	}
+
+	// Get a ref for Event logs. If this fails, podRef will be nil, but the Eventf handler tolerates this.
+	podRef, err := ref.GetReference(api.Scheme, pod)
+	if err != nil {
+		glog.Errorf("Couldn't make a ref to pod %q: '%v'", format.Pod(pod), err)
+	}
+
+	if sandboxChanged && sandboxID != "" {
+		m.recorder.Eventf(podRef, v1.EventTypeWarning, events.SandboxChanged, "Pod sandbox has changed, containers will be killed and recreated")
 	}
 
 	// check the status of init containers.
@@ -451,19 +461,46 @@ func (m *kubeGenericRuntimeManager) computePodContainerChanges(pod *v1.Pod, podS
 	// check the status of containers.
 	for index, container := range pod.Spec.Containers {
 		containerStatus := podStatus.FindContainerStatusByName(container.Name)
-		if containerStatus == nil || containerStatus.State != kubecontainer.ContainerStateRunning {
+		containerRef, err := kubecontainer.GenerateContainerRef(pod, &container)
+		if err != nil {
+			glog.Errorf("Couldn't make a ref to pod %q, container %v: '%v'", format.Pod(pod), container.Name, err)
+		}
+
+		// Was this container running the last time we checked?
+		wasRunning := false
+		if existingStatus != nil {
+			previousContainerStatus := kubecontainer.GetContainerStatus(existingStatus, container.Name)
+			if previousContainerStatus != nil && previousContainerStatus.State.Running != nil {
+				wasRunning = true
+			}
+		}
+
+		if containerStatus == nil {
+			// No container exists by this name, so just start it
+			changes.ContainersToStart[index] = "Starting container"
+			continue
+		} else if containerStatus.State != kubecontainer.ContainerStateRunning {
+			if wasRunning {
+				// The container was running but currently is not. Record that it exited.
+				exitMessage := fmt.Sprintf("Container exited with status %d", containerStatus.ExitCode)
+				if containerStatus.ExitCode == 0 {
+					m.recorder.Eventf(containerRef, v1.EventTypeNormal, events.ExitSuccess, exitMessage)
+				} else {
+					m.recorder.Eventf(containerRef, v1.EventTypeWarning, events.ExitFailure, exitMessage)
+				}
+			}
+
 			if kubecontainer.ShouldContainerBeRestarted(&container, pod, podStatus) {
-				message := fmt.Sprintf("Container %+v is dead, but RestartPolicy says that we should restart it.", container)
-				glog.Info(message)
-				changes.ContainersToStart[index] = message
+				glog.Infof("Container %+v is dead, but RestartPolicy says that we should restart it.", container)
+				changes.ContainersToStart[index] = "Container has died"
 			}
 			continue
 		}
+
 		if sandboxChanged {
 			if pod.Spec.RestartPolicy != v1.RestartPolicyNever {
-				message := fmt.Sprintf("Container %+v's pod sandbox is dead, the container will be recreated.", container)
-				glog.Info(message)
-				changes.ContainersToStart[index] = message
+				glog.Infof("Container %+v's pod sandbox has changed, the container will be recreated.", container)
+				changes.ContainersToStart[index] = "Sandbox has changed"
 			}
 			continue
 		}
@@ -475,6 +512,8 @@ func (m *kubeGenericRuntimeManager) computePodContainerChanges(pod *v1.Pod, podS
 			if pod.Spec.RestartPolicy != v1.RestartPolicyNever {
 				message := fmt.Sprintf("Failed to initialize pod. %q will be restarted.", container.Name)
 				glog.V(1).Info(message)
+
+				m.recorder.Eventf(containerRef, v1.EventTypeWarning, events.ContainerRestarting, message)
 				changes.ContainersToStart[index] = message
 			}
 			continue
@@ -483,10 +522,9 @@ func (m *kubeGenericRuntimeManager) computePodContainerChanges(pod *v1.Pod, podS
 		expectedHash := kubecontainer.HashContainer(&container)
 		containerChanged := containerStatus.Hash != expectedHash
 		if containerChanged {
-			message := fmt.Sprintf("Pod %q container %q hash changed (%d vs %d), it will be killed and re-created.",
-				pod.Name, container.Name, containerStatus.Hash, expectedHash)
-			glog.Info(message)
-			changes.ContainersToStart[index] = message
+			glog.Infof("Pod %q container %q hash changed (%d vs %d), it will be killed and recreated.", pod.Name, container.Name, containerStatus.Hash, expectedHash)
+			changes.ContainersToStart[index] = "Container hash has changed"
+			m.recorder.Eventf(containerRef, v1.EventTypeWarning, events.ContainerRestarting, "Container hash has changed, it will be killed and recreated")
 			continue
 		}
 
@@ -495,10 +533,13 @@ func (m *kubeGenericRuntimeManager) computePodContainerChanges(pod *v1.Pod, podS
 			changes.ContainersToKeep[containerStatus.ID] = index
 			continue
 		}
-		if pod.Spec.RestartPolicy != v1.RestartPolicyNever {
-			message := fmt.Sprintf("pod %q container %q is unhealthy, it will be killed and re-created.", format.Pod(pod), container.Name)
-			glog.Info(message)
-			changes.ContainersToStart[index] = message
+
+		if pod.Spec.RestartPolicy == v1.RestartPolicyNever {
+			m.recorder.Eventf(containerRef, v1.EventTypeWarning, events.ContainerRestarting, "Container has become unhealthy, and will be killed")
+		} else {
+			glog.Infof("pod %q container %q is unhealthy, it will be killed and recreated.", format.Pod(pod), container.Name)
+			changes.ContainersToStart[index] = "Container is unhealthy"
+			m.recorder.Eventf(containerRef, v1.EventTypeWarning, events.ContainerRestarting, "Container has become unhealthy, it will be killed and recreated")
 		}
 	}
 
@@ -542,20 +583,12 @@ func (m *kubeGenericRuntimeManager) computePodContainerChanges(pod *v1.Pod, podS
 //  4. Create sandbox if necessary.
 //  5. Create init containers.
 //  6. Create normal containers.
-func (m *kubeGenericRuntimeManager) SyncPod(pod *v1.Pod, _ v1.PodStatus, podStatus *kubecontainer.PodStatus, pullSecrets []v1.Secret, backOff *flowcontrol.Backoff) (result kubecontainer.PodSyncResult) {
+func (m *kubeGenericRuntimeManager) SyncPod(pod *v1.Pod, existingStatus v1.PodStatus, podStatus *kubecontainer.PodStatus, pullSecrets []v1.Secret, backOff *flowcontrol.Backoff) (result kubecontainer.PodSyncResult) {
 	// Step 1: Compute sandbox and container changes.
-	podContainerChanges := m.computePodContainerChanges(pod, podStatus)
+	podContainerChanges := m.computePodContainerChanges(pod, podStatus, &existingStatus)
 	glog.V(3).Infof("computePodContainerChanges got %+v for pod %q", podContainerChanges, format.Pod(pod))
-	if podContainerChanges.CreateSandbox {
-		ref, err := ref.GetReference(api.Scheme, pod)
-		if err != nil {
-			glog.Errorf("Couldn't make a ref to pod %q: '%v'", format.Pod(pod), err)
-		}
-		if podContainerChanges.SandboxID != "" {
-			m.recorder.Eventf(ref, v1.EventTypeNormal, "SandboxChanged", "Pod sandbox changed, it will be killed and re-created.")
-		} else {
-			glog.V(4).Infof("SyncPod received new pod %q, will create a new sandbox for it", format.Pod(pod))
-		}
+	if podContainerChanges.CreateSandbox && podContainerChanges.SandboxID == "" {
+		glog.V(4).Infof("SyncPod received new pod %q, will create a new sandbox for it", format.Pod(pod))
 	}
 
 	// Step 2: Kill the pod if the sandbox has changed.
