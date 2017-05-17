@@ -18,7 +18,6 @@ package record
 
 import (
 	"encoding/json"
-	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -34,11 +33,6 @@ import (
 
 const (
 	maxLruCacheEntries = 4096
-
-	// if we see the same event that varies only by message
-	// more than 10 times in a 10 minute period, aggregate the event
-	defaultAggregateMaxEvents         = 10
-	defaultAggregateIntervalInSeconds = 600
 )
 
 // getEventKey builds unique event key based on source, involvedObject, reason, message
@@ -53,7 +47,6 @@ func getEventKey(event *v1.Event) string {
 		event.InvolvedObject.APIVersion,
 		event.Type,
 		event.Reason,
-		event.Message,
 	},
 		"")
 }
@@ -91,11 +84,6 @@ func EventAggregatorByReasonFunc(event *v1.Event) (string, string) {
 // EventAggregatorMessageFunc is responsible for producing an aggregation message
 type EventAggregatorMessageFunc func(event *v1.Event) string
 
-// EventAggregratorByReasonMessageFunc returns an aggregate message by prefixing the incoming message
-func EventAggregatorByReasonMessageFunc(event *v1.Event) string {
-	return "(events with common reason combined)"
-}
-
 // EventAggregator identifies similar events and aggregates them into a single event
 type EventAggregator struct {
 	sync.RWMutex
@@ -106,29 +94,16 @@ type EventAggregator struct {
 	// The function that groups events for aggregation
 	keyFunc EventAggregatorKeyFunc
 
-	// The function that generates a message for an aggregate event
-	messageFunc EventAggregatorMessageFunc
-
-	// The maximum number of events in the specified interval before aggregation occurs
-	maxEvents uint
-
-	// The amount of time in seconds that must transpire since the last occurrence of a similar event before it's considered new
-	maxIntervalInSeconds uint
-
 	// clock is used to allow for testing over a time interval
 	clock clock.Clock
 }
 
 // NewEventAggregator returns a new instance of an EventAggregator
-func NewEventAggregator(lruCacheSize int, keyFunc EventAggregatorKeyFunc, messageFunc EventAggregatorMessageFunc,
-	maxEvents int, maxIntervalInSeconds int, clock clock.Clock) *EventAggregator {
+func NewEventAggregator(lruCacheSize int, keyFunc EventAggregatorKeyFunc, clock clock.Clock) *EventAggregator {
 	return &EventAggregator{
-		cache:                lru.New(lruCacheSize),
-		keyFunc:              keyFunc,
-		messageFunc:          messageFunc,
-		maxEvents:            uint(maxEvents),
-		maxIntervalInSeconds: uint(maxIntervalInSeconds),
-		clock:                clock,
+		cache:   lru.New(lruCacheSize),
+		keyFunc: keyFunc,
+		clock:   clock,
 	}
 }
 
@@ -139,53 +114,6 @@ type aggregateRecord struct {
 	localKeys sets.String
 	// The last time at which the aggregate was recorded
 	lastTimestamp metav1.Time
-}
-
-// EventAggregate identifies similar events and groups into a common event if required
-func (e *EventAggregator) EventAggregate(newEvent *v1.Event) (*v1.Event, error) {
-	aggregateKey, localKey := e.keyFunc(newEvent)
-	now := metav1.NewTime(e.clock.Now())
-	record := aggregateRecord{localKeys: sets.NewString(), lastTimestamp: now}
-	e.Lock()
-	defer e.Unlock()
-	value, found := e.cache.Get(aggregateKey)
-	if found {
-		record = value.(aggregateRecord)
-	}
-
-	// if the last event was far enough in the past, it is not aggregated, and we must reset state
-	maxInterval := time.Duration(e.maxIntervalInSeconds) * time.Second
-	interval := now.Time.Sub(record.lastTimestamp.Time)
-	if interval > maxInterval {
-		record = aggregateRecord{localKeys: sets.NewString()}
-	}
-	record.localKeys.Insert(localKey)
-	record.lastTimestamp = now
-	e.cache.Add(aggregateKey, record)
-
-	if uint(record.localKeys.Len()) < e.maxEvents {
-		return newEvent, nil
-	}
-
-	// do not grow our local key set any larger than max
-	record.localKeys.PopAny()
-
-	// create a new aggregate event
-	eventCopy := &v1.Event{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("%v.%x", newEvent.InvolvedObject.Name, now.UnixNano()),
-			Namespace: newEvent.Namespace,
-		},
-		Count:          1,
-		FirstTimestamp: now,
-		InvolvedObject: newEvent.InvolvedObject,
-		LastTimestamp:  now,
-		Message:        e.messageFunc(newEvent),
-		Type:           newEvent.Type,
-		Reason:         newEvent.Reason,
-		Source:         newEvent.Source,
-	}
-	return eventCopy, nil
 }
 
 // eventLog records data about when an event was observed
@@ -238,9 +166,13 @@ func (e *eventLogger) eventObserve(newEvent *v1.Event) (*v1.Event, []byte, error
 		event.FirstTimestamp = lastObservation.firstTimestamp
 		event.Count = int32(lastObservation.count) + 1
 
+		// Use the message of the latest event, so that the aggregated event contains the most up-to-date message
+		event.Message = newEvent.Message
+
 		eventCopy2 := *event
 		eventCopy2.Count = 0
 		eventCopy2.LastTimestamp = metav1.NewTime(time.Unix(0, 0))
+		eventCopy2.Message = ""
 
 		newData, _ := json.Marshal(event)
 		oldData, _ := json.Marshal(eventCopy2)
@@ -333,9 +265,6 @@ func NewEventCorrelator(clock clock.Clock) *EventCorrelator {
 		aggregator: NewEventAggregator(
 			cacheSize,
 			EventAggregatorByReasonFunc,
-			EventAggregatorByReasonMessageFunc,
-			defaultAggregateMaxEvents,
-			defaultAggregateIntervalInSeconds,
 			clock),
 		logger: newEventLogger(cacheSize, clock),
 	}
@@ -346,11 +275,7 @@ func (c *EventCorrelator) EventCorrelate(newEvent *v1.Event) (*EventCorrelateRes
 	if c.filterFunc(newEvent) {
 		return &EventCorrelateResult{Skip: true}, nil
 	}
-	aggregateEvent, err := c.aggregator.EventAggregate(newEvent)
-	if err != nil {
-		return &EventCorrelateResult{}, err
-	}
-	observedEvent, patch, err := c.logger.eventObserve(aggregateEvent)
+	observedEvent, patch, err := c.logger.eventObserve(newEvent)
 	return &EventCorrelateResult{Event: observedEvent, Patch: patch}, err
 }
 
