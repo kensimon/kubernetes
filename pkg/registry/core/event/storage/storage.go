@@ -53,9 +53,10 @@ func NewREST(optsGetter generic.RESTOptionsGetter, ttl uint64) *REST {
 		QualifiedResource: resource,
 		WatchCacheSize:    cachesize.GetWatchCacheSizeByResource(resource.Resource),
 
-		CreateStrategy: event.Strategy,
-		UpdateStrategy: event.Strategy,
-		DeleteStrategy: event.Strategy,
+		CreateStrategy:      event.Strategy,
+		UpdateStrategy:      event.Strategy,
+		DeleteStrategy:      event.Strategy,
+		AggregationStrategy: event.Strategy,
 	}
 	options := &generic.StoreOptions{RESTOptions: opts, AttrFunc: event.GetAttrs} // Pass in opts to use UndecoratedStorage
 	if err := store.CompleteWithOptions(options); err != nil {

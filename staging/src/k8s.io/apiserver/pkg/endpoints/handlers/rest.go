@@ -358,6 +358,9 @@ func createHandler(r rest.NamedCreater, scope RequestScope, typer runtime.Object
 		// TODO: we either want to remove timeout or document it (if we document, move timeout out of this function and declare it in api_installer)
 		timeout := parseTimeout(req.URL.Query().Get("timeout"))
 
+		// Get the name of the resource to be created, if the name was included in the
+		// request. Otherwise, naming the resource will be the responsibility of the
+		// NamedCreator
 		var (
 			namespace, name string
 			err             error
@@ -372,9 +375,12 @@ func createHandler(r rest.NamedCreater, scope RequestScope, typer runtime.Object
 			return
 		}
 
+		// Create a request context and assign the namespace specified by the request
 		ctx := scope.ContextFunc(req)
 		ctx = request.WithNamespace(ctx, namespace)
 
+		// Figure out the request content type, prepare to decode into the appropriate
+		// type
 		gv := scope.Kind.GroupVersion()
 		s, err := negotiation.NegotiateInputSerializer(req, scope.Serializer)
 		if err != nil {
@@ -389,6 +395,7 @@ func createHandler(r rest.NamedCreater, scope RequestScope, typer runtime.Object
 			return
 		}
 
+		// Decode with the expected api group/version/kind to make an api.Object
 		defaultGVK := scope.Kind
 		original := r.New()
 		trace.Step("About to convert to expected version")
@@ -408,6 +415,7 @@ func createHandler(r rest.NamedCreater, scope RequestScope, typer runtime.Object
 		ae := request.AuditEventFrom(ctx)
 		audit.LogRequestObject(ae, obj, scope.Resource.GroupVersion(), scope.Serializer)
 
+		// Check admission
 		if admit != nil && admit.Handles(admission.Create) {
 			userInfo, _ := request.UserFrom(ctx)
 
@@ -474,12 +482,15 @@ func PatchResource(r rest.Patcher, scope RequestScope, admit admission.Interface
 		// api_installer)
 		timeout := parseTimeout(req.URL.Query().Get("timeout"))
 
+		// Get the name and namespace for the resource being updated. This is done
+		// using only the request's URI path.
 		namespace, name, err := scope.Namer.Name(req)
 		if err != nil {
 			scope.err(err, w, req)
 			return
 		}
 
+		// Create a request context, scoped to the requested namespace
 		ctx := scope.ContextFunc(req)
 		ctx = request.WithNamespace(ctx, namespace)
 
@@ -497,6 +508,7 @@ func PatchResource(r rest.Patcher, scope RequestScope, admit admission.Interface
 		}
 		patchType := types.PatchType(contentType)
 
+		// Read the patch in from the body
 		patchJS, err := readBody(req)
 		if err != nil {
 			scope.err(err, w, req)
@@ -506,6 +518,8 @@ func PatchResource(r rest.Patcher, scope RequestScope, admit admission.Interface
 		ae := request.AuditEventFrom(ctx)
 		audit.LogRequestPatch(ae, patchJS)
 
+		// Decode the body into a supported media type, using the serializer for this
+		// request's scope
 		s, ok := runtime.SerializerInfoForMediaType(scope.Serializer.SupportedMediaTypes(), runtime.ContentTypeJSON)
 		if !ok {
 			scope.err(fmt.Errorf("no serializer defined for JSON"), w, req)
@@ -517,6 +531,7 @@ func PatchResource(r rest.Patcher, scope RequestScope, admit admission.Interface
 			scope.Serializer.DecoderToVersion(s.Serializer, schema.GroupVersion{Group: gv.Group, Version: runtime.APIVersionInternal}),
 		)
 
+		// Construct a function to check if this update is admitted
 		updateAdmit := func(updatedObject runtime.Object, currentObject runtime.Object) error {
 			if admit != nil && admit.Handles(admission.Update) {
 				userInfo, _ := request.UserFrom(ctx)
@@ -526,6 +541,7 @@ func PatchResource(r rest.Patcher, scope RequestScope, admit admission.Interface
 			return nil
 		}
 
+		// Patch the resource itself
 		result, err := patchResource(ctx, updateAdmit, timeout, versionedObj, r, name, patchType, patchJS,
 			scope.Namer, scope.Copier, scope.Creater, scope.Defaulter, scope.UnsafeConvertor, scope.Kind, scope.Resource, codec)
 		if err != nil {
@@ -533,6 +549,7 @@ func PatchResource(r rest.Patcher, scope RequestScope, admit admission.Interface
 			return
 		}
 
+		// Set the self-link, if necessary
 		requestInfo, ok := request.RequestInfoFrom(ctx)
 		if !ok {
 			scope.err(fmt.Errorf("missing requestInfo"), w, req)
@@ -794,6 +811,8 @@ func UpdateResource(r rest.Updater, scope RequestScope, typer runtime.ObjectType
 		// TODO: we either want to remove timeout or document it (if we document, move timeout out of this function and declare it in api_installer)
 		timeout := parseTimeout(req.URL.Query().Get("timeout"))
 
+		// Get the name and namespace for the resource being updated. This is done
+		// using only the request's URI path.
 		namespace, name, err := scope.Namer.Name(req)
 		if err != nil {
 			scope.err(err, w, req)
@@ -802,12 +821,15 @@ func UpdateResource(r rest.Updater, scope RequestScope, typer runtime.ObjectType
 		ctx := scope.ContextFunc(req)
 		ctx = request.WithNamespace(ctx, namespace)
 
+		// Read the request body in
 		body, err := readBody(req)
 		if err != nil {
 			scope.err(err, w, req)
 			return
 		}
 
+		// Negotiate how we're going to decode the input using the group/value/kind
+		// from the request's scope
 		s, err := negotiation.NegotiateInputSerializer(req, scope.Serializer)
 		if err != nil {
 			scope.err(err, w, req)
@@ -815,6 +837,9 @@ func UpdateResource(r rest.Updater, scope RequestScope, typer runtime.ObjectType
 		}
 		defaultGVK := scope.Kind
 		original := r.New()
+
+		// Decode the object into a raw api.Object, ensuring it's the same
+		// GroupVersionKind that the current Updater expects.
 		trace.Step("About to convert to expected version")
 		obj, gvk, err := scope.Serializer.DecoderToVersion(s.Serializer, defaultGVK.GroupVersion()).Decode(body, &defaultGVK, original)
 		if err != nil {
@@ -832,11 +857,13 @@ func UpdateResource(r rest.Updater, scope RequestScope, typer runtime.ObjectType
 		ae := request.AuditEventFrom(ctx)
 		audit.LogRequestObject(ae, obj, scope.Resource.GroupVersion(), scope.Serializer)
 
+		// Also make sure the Name in the object's body matches the name in the URI
 		if err := checkName(obj, name, namespace, scope.Namer); err != nil {
 			scope.err(err, w, req)
 			return
 		}
 
+		// Run object through any transformations that should happen
 		var transformers []rest.TransformFunc
 		if admit != nil && admit.Handles(admission.Update) {
 			transformers = append(transformers, func(ctx request.Context, newObj, oldObj runtime.Object) (runtime.Object, error) {
@@ -845,6 +872,7 @@ func UpdateResource(r rest.Updater, scope RequestScope, typer runtime.ObjectType
 			})
 		}
 
+		// Store the object
 		trace.Step("About to store object in database")
 		wasCreated := false
 		result, err := finishRequest(timeout, func() (runtime.Object, error) {
@@ -858,6 +886,7 @@ func UpdateResource(r rest.Updater, scope RequestScope, typer runtime.ObjectType
 		}
 		trace.Step("Object stored in database")
 
+		// With the object stored, we now know its self-link, so set that.
 		requestInfo, ok := request.RequestInfoFrom(ctx)
 		if !ok {
 			scope.err(fmt.Errorf("missing requestInfo"), w, req)
@@ -869,6 +898,7 @@ func UpdateResource(r rest.Updater, scope RequestScope, typer runtime.ObjectType
 		}
 		trace.Step("Self-link added")
 
+		// Respond with the serialized object and the appropriate headers
 		status := http.StatusOK
 		if wasCreated {
 			status = http.StatusCreated

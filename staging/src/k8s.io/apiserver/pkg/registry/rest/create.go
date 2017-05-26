@@ -26,6 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
+	"k8s.io/apiserver/pkg/storage"
 	"k8s.io/apiserver/pkg/storage/names"
 )
 
@@ -56,6 +57,19 @@ type RESTCreateStrategy interface {
 	// validation has succeeded but before the object has been persisted.
 	// This method may mutate the object.
 	Canonicalize(obj runtime.Object)
+}
+
+// AggregatedCreateStrategy allows creates to update existing objects instead
+// of creating new ones.
+type AggregatedCreateStrategy interface {
+	AggregatedResource(ctx genericapirequest.Context, obj runtime.Object) (string, storage.SimpleUpdateFunc, error)
+}
+type AggregationUpdateFunc func(runtime.Object) (runtime.Object, error)
+
+type NeverAggregateStrategy struct{}
+
+func (*NeverAggregateStrategy) AggregatedResource(_ genericapirequest.Context, _ runtime.Object) (string, storage.SimpleUpdateFunc, error) {
+	return "", func(obj runtime.Object) (runtime.Object, error) { return obj, nil }, nil
 }
 
 // BeforeCreate ensures that common operations for all resources are performed on creation. It only returns

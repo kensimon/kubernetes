@@ -155,6 +155,9 @@ type Store struct {
 	// ExportStrategy implements resource-specific behavior during export,
 	// optional. Exported objects are not decorated.
 	ExportStrategy rest.RESTExportStrategy
+	// AggregationStrategy implements logic to redirect creation of resources into an update
+	// of a common, aggregated resource.
+	AggregationStrategy rest.AggregatedCreateStrategy
 
 	// Storage is the interface for the underlying storage for the resource.
 	Storage storage.Interface
@@ -285,9 +288,42 @@ func (e *Store) Create(ctx genericapirequest.Context, obj runtime.Object) (runti
 	if err != nil {
 		return nil, err
 	}
+
 	out := e.NewFunc()
-	if err := e.Storage.Create(ctx, key, obj, out, ttl); err != nil {
-		err = storeerr.InterpretCreateError(err, e.QualifiedResource, name)
+	var createErr error
+
+	existingName, updateFunc, err := e.AggregationStrategy.AggregatedResource(ctx, obj)
+	if err != nil {
+		return nil, err
+	}
+
+	if existingName != "" {
+		glog.Infof("XXX Got a duplicate resource: %s matches %s", existingName, name)
+		key, err := e.KeyFunc(ctx, existingName)
+		if err != nil {
+			return nil, err
+		}
+
+		// Wrap the AggregationUpdateFunc in a storage.UpdateFunc for GuaranteedUpdate
+		storageUpdater := func(input runtime.Object, res storage.ResponseMeta) (runtime.Object, *uint64, error) {
+			newObj, err := updateFunc(input)
+			return newObj, &ttl, err
+		}
+
+		createErr = e.Storage.GuaranteedUpdate(
+			ctx,
+			key,
+			e.NewFunc(),
+			true,
+			nil,
+			storageUpdater,
+		)
+	} else {
+		createErr = e.Storage.Create(ctx, key, obj, out, ttl)
+	}
+
+	if createErr != nil {
+		err = storeerr.InterpretCreateError(createErr, e.QualifiedResource, name)
 		err = rest.CheckGeneratedNameError(e.CreateStrategy, err, obj)
 		if !kubeerr.IsAlreadyExists(err) {
 			return nil, err
@@ -1212,6 +1248,10 @@ func (e *Store) CompleteWithOptions(options *generic.StoreOptions) error {
 			}
 			return accessor.GetName(), nil
 		}
+	}
+
+	if e.AggregationStrategy == nil {
+		e.AggregationStrategy = &rest.NeverAggregateStrategy{}
 	}
 
 	if e.Storage == nil {

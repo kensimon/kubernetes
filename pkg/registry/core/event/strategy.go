@@ -22,6 +22,7 @@ import (
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/clock"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/registry/generic"
@@ -29,6 +30,7 @@ import (
 	"k8s.io/apiserver/pkg/storage/names"
 	"k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/api/validation"
+	"k8s.io/kubernetes/pkg/registry/tools/record"
 )
 
 type eventStrategy struct {
@@ -39,6 +41,7 @@ type eventStrategy struct {
 // Strategy is the default logic that pplies when creating and updating
 // Event objects via the REST API.
 var Strategy = eventStrategy{api.Scheme, names.SimpleNameGenerator}
+var eventCorrelator = record.NewEventCorrelator(clock.RealClock{})
 
 func (eventStrategy) NamespaceScoped() bool {
 	return true
@@ -70,6 +73,31 @@ func (eventStrategy) ValidateUpdate(ctx genericapirequest.Context, obj, old runt
 
 func (eventStrategy) AllowUnconditionalUpdate() bool {
 	return true
+}
+
+// AggregatedResource finds an existing Event that may need to be udpated instead of
+// having the new one be created, and returns the aggregated event (with
+// modifications), if found.
+func (es eventStrategy) AggregatedResource(ctx genericapirequest.Context, obj runtime.Object) (string, storage.SimpleUpdateFunc, error) {
+	event, ok := obj.(*api.Event)
+	if !ok {
+		panic("not an event")
+	}
+
+	eventName, bumper := eventCorrelator.EventCorrelate(event)
+
+	// We found a correlated event, construct an UpdateFunc to update it,
+	// wrapping the parameters in a runtime.Object
+	updateFunc := func(input runtime.Object) (output runtime.Object, err error) {
+		existingEvent, ok := input.(*api.Event)
+		if !ok {
+			panic("not an event")
+		}
+
+		return bumper(existingEvent)
+	}
+
+	return eventName, updateFunc, nil
 }
 
 // GetAttrs returns labels and fields of a given object for filtering purposes.

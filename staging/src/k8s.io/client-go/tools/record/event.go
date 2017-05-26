@@ -115,28 +115,18 @@ func (eventBroadcaster *eventBroadcasterImpl) StartRecordingToSink(sink EventSin
 	// The default math/rand package functions aren't thread safe, so create a
 	// new Rand object for each StartRecording call.
 	randGen := rand.New(rand.NewSource(time.Now().UnixNano()))
-	eventCorrelator := NewEventCorrelator(clock.RealClock{})
 	return eventBroadcaster.StartEventWatcher(
 		func(event *v1.Event) {
-			recordToSink(sink, event, eventCorrelator, randGen, eventBroadcaster.sleepDuration)
+			recordToSink(sink, event, randGen, eventBroadcaster.sleepDuration)
 		})
 }
 
-func recordToSink(sink EventSink, event *v1.Event, eventCorrelator *EventCorrelator, randGen *rand.Rand, sleepDuration time.Duration) {
+func recordToSink(sink EventSink, event *v1.Event, randGen *rand.Rand, sleepDuration time.Duration) {
 	// Make a copy before modification, because there could be multiple listeners.
 	// Events are safe to copy like this.
-	eventCopy := *event
-	event = &eventCopy
-	result, err := eventCorrelator.EventCorrelate(event)
-	if err != nil {
-		utilruntime.HandleError(err)
-	}
-	if result.Skip {
-		return
-	}
 	tries := 0
 	for {
-		if recordEvent(sink, result.Event, result.Patch, result.Event.Count > 1, eventCorrelator) {
+		if recordEvent(sink, event) {
 			break
 		}
 		tries++
@@ -168,21 +158,12 @@ func isKeyNotFoundError(err error) bool {
 // was successfully recorded or discarded, false if it should be retried.
 // If updateExistingEvent is false, it creates a new event, otherwise it updates
 // existing event.
-func recordEvent(sink EventSink, event *v1.Event, patch []byte, updateExistingEvent bool, eventCorrelator *EventCorrelator) bool {
-	var newEvent *v1.Event
+func recordEvent(sink EventSink, event *v1.Event) bool {
 	var err error
-	if updateExistingEvent {
-		newEvent, err = sink.Patch(event, patch)
-	}
-	// Update can fail because the event may have been removed and it no longer exists.
-	if !updateExistingEvent || (updateExistingEvent && isKeyNotFoundError(err)) {
-		// Making sure that ResourceVersion is empty on creation
-		event.ResourceVersion = ""
-		newEvent, err = sink.Create(event)
-	}
+	// Making sure that ResourceVersion is empty on creation
+	event.ResourceVersion = ""
+	_, err = sink.Create(event)
 	if err == nil {
-		// we need to update our event correlator with the server returned state to handle name/resourceversion
-		eventCorrelator.UpdateState(newEvent)
 		return true
 	}
 
