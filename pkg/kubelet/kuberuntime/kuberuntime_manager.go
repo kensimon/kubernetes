@@ -30,9 +30,7 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/flowcontrol"
-	"k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/api/v1"
-	"k8s.io/kubernetes/pkg/api/v1/ref"
 	"k8s.io/kubernetes/pkg/credentialprovider"
 	internalapi "k8s.io/kubernetes/pkg/kubelet/apis/cri"
 	runtimeapi "k8s.io/kubernetes/pkg/kubelet/apis/cri/v1alpha1"
@@ -438,16 +436,6 @@ func (m *kubeGenericRuntimeManager) computePodContainerChanges(pod *v1.Pod, podS
 		ContainersToKill:     make(map[kubecontainer.ContainerID]containerToKillInfo),
 	}
 
-	// Get a ref for Event logs. If this fails, podRef will be nil, but the Eventf handler tolerates this.
-	podRef, err := ref.GetReference(api.Scheme, pod)
-	if err != nil {
-		glog.Errorf("Couldn't make a ref to pod %q: '%v'", format.Pod(pod), err)
-	}
-
-	if sandboxChanged && sandboxID != "" {
-		m.recorder.Eventf(podRef, v1.EventTypeWarning, events.SandboxChanged, "Pod sandbox has changed, containers will be killed and recreated")
-	}
-
 	// check the status of init containers.
 	initFailed := false
 	// always reset the init containers if the sandbox is changed.
@@ -466,11 +454,13 @@ func (m *kubeGenericRuntimeManager) computePodContainerChanges(pod *v1.Pod, podS
 			glog.Errorf("Couldn't make a ref to pod %q, container %v: '%v'", format.Pod(pod), container.Name, err)
 		}
 
-		// Was this container running the last time we checked?
+		// Was this container running the last time we checked? We care if it had a status and wasn't
+		// terminated. In a state of "waiting" counts too, because we want to emit an exited status even if
+		// never got to "Running" before it exited.
 		wasRunning := false
 		if existingStatus != nil {
 			previousContainerStatus := kubecontainer.GetContainerStatus(existingStatus, container.Name)
-			if previousContainerStatus != nil && previousContainerStatus.State.Running != nil {
+			if previousContainerStatus != nil && previousContainerStatus.State.Terminated == nil {
 				wasRunning = true
 			}
 		}
