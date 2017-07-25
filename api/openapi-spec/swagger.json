@@ -59038,8 +59038,8 @@
     }
    },
    "io.k8s.apimachinery.pkg.util.intstr.IntOrString": {
-    "type": "string",
-    "format": "int-or-string"
+    "type": "integer",
+    "format": "int32"
    },
    "io.k8s.apimachinery.pkg.version.Info": {
     "description": "Info contains versioning information. how we'll want to distribute that information.",
